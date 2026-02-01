@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>sce - simple code editor</title>
+</head>
+<body>
+    <h1>sce - simple code editor</h1>
+    <!-- start of code editor -->
+    <div>
+        <style>
+            #find-status::-webkit-scrollbar {
+                display: none;
+            }
+        </style>
+        <div id="find-replace-bar" style="display: none;">
+            <input type="text" id="find-input" placeholder="Find">
+
+            <button id="case-sensitive-button" title="Match Case">Aa</button>
+            <button id="regex-button" title="Use Regular Expression">.*</button>
+
+            <input type="text" id="replace-input" placeholder="Replace">
+
+            <button onclick="findNext()">Find Next</button>
+            <button onclick="replace()">Replace</button>
+            <button onclick="replaceAll()">Replace All</button>
+
+            <button id="close-find-bar" style="font-weight: bold; padding: 3px 10px;">x</button>
+            <span id="find-status"></span>
+        </div>
+        <div id="editor-container" style="position: relative;">
+            <pre id="highlighting" aria-hidden="true"></pre>
+            <textarea spellcheck="false" id="editor" maxLength=16000 style></textarea>
+        <script>
+"use strict"
+{ //wrapping in a block so local variables don't leak outside
+    let config = {
+        indentChars: ["[","{","("],
+        dedentChars: ["]","}",")"],
+        closerChars: {
+            "[":"]",
+            "{":"}",
+            "(":")",
+            "'":"'",
+            '"':'"',
+            "`":"`",
+            //not including "/*":"*/" because it's often used differently (such as commenting out parts of code), and also because it would require checking more than just event.key
+        },
+        inlineComment: "//",
+        //this is the one object you may want to edit if you're changing your language or something:
+        editor: {
+            tabSize: 4,
+            backgroundColor: "#1C1E26",
+            color: "#CFCFCF", //font color
+            fontFamily: "monospace", //you can use css font families with multiple fonts
+            syntax: {
+                //the key names are just for mental ease (and also to be able to refer to them using arrays)
+                inlineComment: [/\/\/.*/g,"#999"],
+                multilineComment: [/\/\*[^]*?(\*\/|$)/g,"#999",{
+                    jsDocTag: [/(?<=[* ])@[a-z]+\b/gi, "#f00"],
+                    jsDocType: [/{.+}/gi, "#cff"],
+                }],
+                string: [/(["'])(?:\\(?:\r\n|[^])|(?!\1)[^\\\r\n])*\1/g,"#0f0"],
+                templateLiteral: [/`(?:\\[^]|[^\\`])*`/g, "#0f0", /*{ //temporarily disabled templateLiteral interpolation rules because they can't handle recursive nesting yet
+                    interpolation: [/\${[^]*?}/g, "#fff", {
+                        //highlight code inside ${} as js
+                        actualText: [/(?<=^\${)[^]+(?=}$)/g, "#f63",[]], //arrays let you reference an object, so empty array just refers to the whole syntax object (if say you wanted to refer to syntax.multilineComment.jsDocTag, you would use ["multilineComment","jsDocTag"])
+                    }]
+                }*/],
+                reservedKeyword: [/\b(await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|import|in|instanceof|new|null|return|super|switch|this|throw|true|try|typeof|var|void|while|with|yield|implements|interface|let|package|private|protected|public|static)\b/g,"#ff0"],
+                binaryNumber: [/\b0b[0-1]+?\b/gi,"#0ff"],
+                octalNumber: [/\b0o[0-7]+?\b/gi,"#0ff"],
+                hexNumber: [/\b0x[0-9a-f]+\b/gi,"#0ff"],
+                number: [/\b\d+\.?\d*e?\d*[Nn]?\b/g,"#0ff"],
+                functionName: [/\b[a-z_]\w*(?= *(\(|=>))/gi, "#f90"],
+                operator: [/[+\-*\/%=<>!&|^~?:=]/g, "#f63"],
+                punctuation: [/\W/g,"#c99"]
+                //not including regex because it's ridiculously difficult to distinguish it with division
+            }
+        }
+    }
+
+    let isMac = navigator.platform.toUpperCase().includes('MAC') //is the user a mac?
+    let cmd = isMac?"metaKey":"ctrlKey"
+    let textarea = document.getElementById('editor')
+    //helper functions to escape regex, replacement, and html strings
+    let escRegex = str => str.replace(/[/\-\\^$*+?.()|[\]{}]/g,'\\$&')
+    let escReplace = str => str.replace(/\$/g,'$$$$')
+    let escHtml = str => str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    //better last index,
+    let lastIndex = (str,char,max) => (max<0?-1:str.lastIndexOf(char,max))
+    //set text in a range
+    let setText = (str, start, end, mode = "end") => {
+            if(document.execCommand){
+                textarea.focus()
+                textarea.setSelectionRange(start, end)
+                document.execCommand('insertText', false, str) //using document.execCommand so it writes to the browser's undo stack
+                if(mode === 'select') {
+                    textarea.setSelectionRange(start, start + str.length)
+                }
+            } else {
+                textarea.setRangeText(str, start, end, mode) //fallback for if document.execCommand isn't supported or if it gets removed. Note: this doesn't write to the undo stack
+            }
+        }
+    //setting styles through js
+    let styles = {
+        width: "65rem",
+        height: "40rem",
+        fontSize: "1.3rem",
+        lineHeight: "1.69rem",
+        boxSizing: "border-box",
+        lineBreak: "anywhere",
+        padding: "0.4rem",
+        textAlign: "left",
+        resize: "none",
+        whiteSpace: "break-spaces", //allows whitespaces to come onto newlines
+        border: "none",            //remove all default borders to prevent misalignment
+        overflowY: "scroll",
+        outline: "none",
+        tabSize: config.editor.tabSize,
+        fontFamily: config.editor.fontFamily,
+        position: "absolute",
+        contain: "strict",
+        top: 0,
+        left: 0,
+        margin: 0,
+        background: "transparent", //transparent because there's a separare pre doing the syntax highlighting magic
+        color: "transparent", //same reason
+        caretColor: config.editor.color, //the cursor, however, needs to be visible.
+        zIndex: 1 //on top
+    }
+    Object.assign(textarea.style, styles)
+    //similar styles for the syntax highligher pre:
+    let highlightStyles = {
+        ...styles,
+        background: config.editor.backgroundColor,
+        color: config.editor.color,
+        zIndex: 0,
+        pointerEvents: "none", //only accept clicks at textarea, don't care about clicks on the pre
+        overflow: "hidden"
+    }
+    Object.assign(document.getElementById('highlighting').style, highlightStyles)
+    //simple monkey patch for macos chrome users where selecting with mouse always gives selectionDirection of "none" (seriously, how've they not fixed this yet)
+    let prevStart = -1 //initialise stored selection start to -1 (dummy value)
+    textarea.addEventListener('mousedown',function(event){
+        prevStart = this.selectionStart //store current selection start pos for comparison later
+    })
+    textarea.addEventListener('keydown',function(event){
+        if(prevStart<0) return
+        this.selectionDirection = this.selectionStart<prevStart ? "backward" : "forward" //if the new start pos is less than the stored one, you're going backwards.
+        prevStart=-1
+    })
+    //end of monkey patch :D
+
+    //clean up pasted text:
+    textarea.addEventListener('paste', function(event) {
+        let pastedText = (event.clipboardData || window.clipboardData)?.getData('text') ?? ''
+        if(!pastedText) return
+        event.preventDefault()
+        let text = this.value
+        let softTab = ' '.repeat(config.editor.tabSize)
+        let softPaste = pastedText.replace(/\t/g, softTab)
+        setText(softPaste, this.selectionStart, this.selectionEnd, 'end')
+    })
+
+    textarea.addEventListener('keydown', function(event){
+        let textarea = this //easier for my brain
+        let cdir = textarea.selectionDirection!=="backward" //is selection the normal beginning-to-end?
+        let cpos = cdir?textarea.selectionStart:textarea.selectionEnd //selection position start, same as cend when just the cursor
+        let cend = cdir?textarea.selectionEnd:textarea.selectionStart //selection position end (relevant when there's a selection)
+        let origStart = textarea.selectionStart
+        let origEnd = textarea.selectionEnd
+        let setSelectionStart = pos => textarea.selectionStart = pos
+        let setSelectionEnd = pos => textarea.selectionEnd = pos
+        let setSelection = (s,e) =>{
+            if(s > e) {
+                textarea.setSelectionRange(e, s, "backward")
+            } else {
+                textarea.setSelectionRange(s, e, "forward")
+            }
+        }
+        let setCursorPos = pos => setSelection(pos,pos)
+        let text = textarea.value
+        let lnpos = lastIndex(text,"\n",cend-1) //last newline pos, works cleanly even for -1
+        let col = cend-lnpos - 1
+        let arrowDir = (event.key === "ArrowRight") - (event.key === "ArrowLeft") //1 = right, -1 = left, 0 = none
+        if(event.key === 'Tab') {
+            event.preventDefault()
+            if(cpos===cend) {
+                let spacesToInsert = config.editor.tabSize - (col % config.editor.tabSize) //spaces until next tab stop
+                let spaceStr = ' '.repeat(spacesToInsert)
+                setText(spaceStr,cend,cend,'end')
+            } else {
+                let isIndent = !event.shiftKey
+                let nlPos = lastIndex(text,"\n",textarea.selectionStart)+1 //adding a newline to the beginning to ensure start of text also gets indented
+                let origText = "\n"+text.slice(nlPos,textarea.selectionEnd)
+                let matchRegex = isIndent? /\n/g : new RegExp("\n {0,"+config.editor.tabSize+"}","g")
+                let replaceStr = isIndent? "\n"+' '.repeat(config.editor.tabSize) : "\n"
+                let nlCount = 0
+                let newText = origText.replace(matchRegex,()=>(nlCount++,replaceStr)).slice(1)
+                setText(newText,nlPos,textarea.selectionEnd,'select')
+                let offset = isIndent?config.editor.tabSize:-config.editor.tabSize
+                textarea.selectionStart = origStart + offset
+                textarea.selectionEnd = origEnd + offset * nlCount
+            }
+            return
+        }
+        if(arrowDir) {
+            let charDir = -(arrowDir<0) //-1->-1 and 1->0, to easily check chars to the right and left of cursor
+            if(cpos!==cend && !event.shiftKey) return
+            if(text[cend+charDir]==="\n") return //keeping default behaviour for newlines cuz col changes are less clean otherwise
+            if(event.metaKey||event.ctrlKey||event.altKey) return //don't do anything if modifier key is pressed
+            if(cend===0&&arrowDir<0 || cend===text.length&&arrowDir>0) return //if trying to move past edge, do nothing
+            if(col%config.editor.tabSize) return //use default behaviour if not at a tab stop
+            event.preventDefault()
+            let newCend = cend+arrowDir
+            let newCol = col+arrowDir
+            if(text.substring(cend,cend+arrowDir*config.editor.tabSize)===" ".repeat(config.editor.tabSize)){
+                while(text[newCend+charDir]===" " && newCol%config.editor.tabSize){ //while the next char is a space AND not at a tab stop
+                    newCend+=arrowDir
+                    newCol+=arrowDir
+                }
+            }
+            if(event.shiftKey){
+                setSelection(cpos,newCend)
+            } else {
+                setCursorPos(newCend)
+            }
+        return
+        }
+        if(event.key === "Backspace") {
+            if(event.metaKey||event.ctrlKey||event.altKey||event.shiftKey) return //don't do anything if modifier or shift key is pressed
+            if(cpos!==cend) return //if something is selected use normal behaviour
+            if(!(col%config.editor.tabSize) //use default behaviour if not at a tab stop
+            && text.slice(cend-config.editor.tabSize,cend)===" ".repeat(config.editor.tabSize)) {
+                event.preventDefault()
+                setText("",cend-config.editor.tabSize,cend,'start')
+                return
+            }
+            if(cend<text.length&&config.closerChars[text[cend-1]]===text[cend]) {
+                event.preventDefault()
+                setText("",cend-1,cend+1,'start')
+                return
+            }
+            return
+        }
+        let openerChar = config.indentChars.indexOf(text[cpos-1]) //-1 when not found
+        let closerChar = config.dedentChars.indexOf(text[cpos])
+        let isOpener = ~openerChar //~ turns -1 into 0 (falsy)
+        let isCloser = ~closerChar //same here
+        let isPair = isOpener && openerChar === closerChar //if the enter is pressed in a situation like {|}
+        if(event.key === "Enter") {
+            if(event.metaKey||event.ctrlKey||event.altKey||event.shiftKey) return //don't do anything if modifier or shift key is pressed, so Shift+Enter creates unindented line
+            if(cpos!==cend) return //keep default behaviour for when text is selected
+            event.preventDefault()
+            let currIndentLevel = text.slice(lnpos+1,cend).match(/^ */)[0].length
+            let newIndentLevel = currIndentLevel + (isOpener?config.editor.tabSize:0)
+            let str = "\n"+" ".repeat(newIndentLevel) + (isPair?"\n"+" ".repeat(currIndentLevel):"")
+            setText(str,cpos,cend,'end')
+            if(isPair) textarea.selectionStart = textarea.selectionEnd = cpos+newIndentLevel+1
+            return
+        }
+        if(cpos===cend && text[cpos] === event.key && Object.values(config.closerChars).includes(event.key)) { //alt key let's you override type-through
+            event.preventDefault()
+            if(event[cmd])setText(event.key,cpos,cend,'end') //if cmd is pressed, allow overtyping
+            setCursorPos(cpos + 1)
+            return
+        }
+        if(config.closerChars[event.key]) {
+            event.preventDefault()
+            let selectedStr = text.slice(origStart,origEnd)
+            let newStr = event.key + selectedStr + config.closerChars[event.key]
+            setText(newStr,origStart,origEnd,'end')
+            textarea.selectionEnd = origEnd+1
+            textarea.selectionStart = origStart+1
+        }
+        let dedentChar = config.dedentChars.indexOf(event.key)
+        if(~dedentChar) {
+            if(event.metaKey||event.ctrlKey||event.altKey) return //don't do anything if modifier key is pressed
+            if(cpos!==cend) return //keep default behaviour for when text is selected
+            let preline =  text.slice(lnpos+1,cpos)
+            let currIndentLevel = preline.match(/^ */)[0].length
+            if(preline.length !== currIndentLevel) return //if not the first non-space character on the line, do nothing
+            let openChar = config.indentChars[dedentChar] //the corresponding opening char
+            let lastOpener = lastIndex(text,openChar,cpos) //where the last opening char was encountered
+            if(!~lastOpener) return //if there was no opener, do nothing
+            event.preventDefault()
+            let openerLnpos = lastIndex(text,"\n",lastOpener)
+            let openerIndentLevel = text.slice(openerLnpos+1,lastOpener).match(/^ */)[0].length
+            let newCurrLine = " ".repeat(openerIndentLevel) + event.key
+            setText(newCurrLine,cpos-currIndentLevel,cpos,'end')
+            return
+        }
+        if(event[cmd] && event.key === '/') {
+            event.preventDefault()
+            
+            let blockStart = lastIndex(text,"\n", origStart - 1) + 1 //start of line
+            let possibleBlockEnd = text.indexOf("\n", origEnd)
+            let blockEnd = possibleBlockEnd === -1 ? text.length : possibleBlockEnd
+            
+            let block = text.substring(blockStart, blockEnd)
+            let lines = block.split("\n")
+            
+            let isCommented = lines.every(line => line.trim().length === 0 || line.trim().startsWith(config.inlineComment)) //unless every line is commented, you comment (excluding empty lines obviously)
+            
+            let matchRegex = isCommented?new RegExp("^( *)"+escRegex(config.inlineComment)+" ?"):/^( *)/
+            let replaceStr = '$1'+(isCommented?'':escReplace(config.inlineComment)+' ')
+
+            let newBlock = lines.map(line => (line?line.replace(matchRegex,replaceStr):'')).join("\n") //modify every line to form a new block
+            setText(newBlock, blockStart, blockEnd, 'end')
+            textarea.setSelectionRange(origStart + (blockStart===origStart?0:(isCommented?-config.inlineComment.length-1:+config.inlineComment.length+1)), origEnd+newBlock.length-block.length)
+            return
+        }
+        let varrow = ["ArrowUp","ArrowDown"].indexOf(event.key) //vertical arrow
+        if(event.altKey && ~varrow) {
+            event.preventDefault()
+
+            let blockStart = lastIndex(text,"\n", origStart - 1) + 1
+            let possibleBlockEnd = text.indexOf("\n", origEnd)
+            let blockEnd = possibleBlockEnd === -1?text.length:possibleBlockEnd
+            let block = text.slice(blockStart, blockEnd)
+
+            if(event.shiftKey) { //clone block up/down
+                let newText = block + "\n" + block
+                if(blockEnd === text.length) newText = "\n" + block //count end as linebreak
+                
+                setText(block + "\n", blockStart, blockStart, 'end')
+                let offset = varrow?block.length+1:0 //if you're cloning it downwards, you cursor should shift down also
+                textarea.setSelectionRange(origStart+offset,origEnd+offset) 
+            } else { //or just move block up/down
+                if(varrow) { //down
+                    if(blockEnd === text.length) return //nowhere to move down
+                    let nextLnEnd = text.indexOf("\n", blockEnd + 1) //search from next line
+                    if(nextLnEnd === -1) nextLnEnd = text.length //count end as linebreak
+                    let nextLn = text.slice(blockEnd + 1, nextLnEnd) 
+                    setText(nextLn + "\n" + block, blockStart, nextLnEnd, 'end')
+                    let offset = nextLn.length + 1 //cursor moves with the moving line
+                    textarea.setSelectionRange(origStart + offset, origEnd + offset)
+                } else { //up
+                    if(blockStart === 0) return //nowhere to move up
+                    let prevLnStart = lastIndex(text,"\n", blockStart - 2) +1 //search from previous line
+                    let prevLn = text.slice(prevLnStart, blockStart - 1)
+                    //if(prevLnStart === 1 && prevLn === "")prevLnStart = 0
+                    setText(block + "\n" + prevLn, prevLnStart, blockEnd, 'end')
+                    let offset = blockStart - prevLnStart //cursor moves with the moving line
+                    textarea.setSelectionRange(origStart - offset, origEnd - offset)
+                }
+            }
+            return
+        }
+    })
+    let findBar = document.getElementById('find-replace-bar')
+    let findInput = document.getElementById('find-input')
+    let replaceInput = document.getElementById('replace-input')
+    let findStatus = document.getElementById('find-status')
+    let caseButton = document.getElementById('case-sensitive-button')
+    let regexButton = document.getElementById('regex-button')
+    let closeButton = document.getElementById('close-find-bar')
+    //if the user presses cmd+f, whether that's in the textarea or the find bar, you toggle the find bar.
+    let handleCmdF = event => {
+        if(event[cmd] && event.key === 'f') {
+            event.preventDefault()
+            if(findBar.style.display === 'flex') textarea.focus() //if it was visible before, textarea should now be in focus
+            findBar.style.display = findBar.style.display === 'none' ? 'flex' : 'none'
+            if(findBar.style.display === 'flex') findInput.focus() //if it was just turned on to be visible, the findInput should now be in focus
+        }
+    }
+    textarea.addEventListener('keydown',handleCmdF)
+    findBar.addEventListener('keydown',handleCmdF)
+    
+    let caseSensitive = false
+    let useRegex = false
+
+    let updateToggleStyles = () => { //toggle styles for regex and case button
+        caseButton.style.border = caseSensitive ? "1px solid #fff" : "1px solid #444"
+        caseButton.style.opacity = caseSensitive ? "1" : "0.5"
+        regexButton.style.border = useRegex ? "1px solid #fff" : "1px solid #444"
+        regexButton.style.opacity = useRegex ? "1" : "0.5"
+    }
+
+    caseButton.onclick = () => { //click to toggle
+        caseSensitive = !caseSensitive
+        updateToggleStyles()
+    }
+    regexButton.onclick = () => { //click to toggle
+        useRegex = !useRegex
+        updateToggleStyles()
+    }
+    closeButton.onclick = () => { //click to close (same as pressing cmd+f when findbar is open)
+        findBar.style.display = 'none'
+        textarea.focus()
+    }
+    Object.assign(findBar.style, { //main find bar styles
+        backgroundColor: config.editor.backgroundColor,
+        padding: "0.4rem",
+        borderBottom: "1px solid "+config.editor.color,
+        fontFamily: config.editor.fontFamily,
+        gap: "10px",
+        alignItems: "center",
+        width: "65rem",
+        boxSizing: "border-box",
+    }); //ok so I placed semicolon specifically here because otherwise it reads the next line as a property accessor
+
+    //input styles
+    [findInput, replaceInput].forEach(element => {
+        Object.assign(element.style, {
+            fontFamily: config.editor.fontFamily,
+            background: config.editor.backgroundColor,
+            color: config.editor.color,
+            border: "1px solid #444",
+            padding: "3px 8px",
+            outline: "none"
+        })
+    })
+
+    //button styles
+    Array.from(findBar.querySelectorAll('button')).forEach(button => {
+        Object.assign(button.style,{
+        fontFamily: config.editor.fontFamily,
+        cursor: "pointer",
+        color: config.editor.color,
+        backgroundColor: config.editor.backgroundColor,
+    }
+    )
+    })
+
+    //status styles
+    Object.assign(findStatus.style, {
+        fontFamily: config.editor.fontFamily,
+        color: config.editor.color,
+        fontSize: "0.8rem",
+        whiteSpace: "nowrap",
+        overflowX: "auto",
+        flex: "1",
+        minWidth: "0",
+        scrollbarWidth: "none",
+        msOverflowStyle: "none",
+    })
+    updateToggleStyles()
+    let getRegex = (full=false) => {
+        let pattern = findInput.value
+        if(!pattern) return null
+        try {
+            if(!useRegex) pattern = escRegex(pattern)
+            if(full) pattern = "^"+pattern+"$"
+            return new RegExp(pattern,caseSensitive?"g":"gi")
+        } catch (e) {
+            findStatus.innerText = "Your regex is...invalid."
+            return null
+        }
+    }
+    globalThis.findNext = () => {
+        let findStr = findInput.value
+        if(!findStr) return findStatus.innerText = "What exactly are you finding?"
+
+        let fullText = textarea.value
+        let matchRegex = getRegex()
+        
+        matchRegex.lastIndex = textarea.selectionEnd //start searching from selection's end
+        let match = matchRegex.exec(fullText)
+        if(!match) { //wrap around
+            matchRegex.lastIndex = 0
+            match = matchRegex.exec(fullText)
+        }
+
+        if(match) {
+            let idx = match.index
+            let matchLen = match[0].length
+
+            textarea.setSelectionRange(idx, idx + matchLen) //select the text
+            textarea.focus()
+
+            findStatus.innerText = (idx%2?"Here you go (index ":"Is this it? (index ")+idx+"):"
+        } else {
+            findStatus.innerText = "No matches found :/"
+        }
+    }
+
+    globalThis.replace=()=>{
+        let findStr = findInput.value
+        if(!findStr) return findStatus.innerText = "But, what do you want to replace?"
+        let replace = replaceInput.value
+        if(textarea.selectionStart !== textarea.selectionEnd && getRegex(true).test(textarea.value.slice(textarea.selectionStart,textarea.selectionEnd))) {
+            setText(replace, textarea.selectionStart, textarea.selectionEnd, 'select')
+        }
+        findNext()
+    }
+
+    globalThis.replaceAll=()=>{
+        let findStr = findInput.value
+        let replace = replaceInput.value
+        if(!findStr) return findStatus.innerText = "There is nothing to replace though!"
+        
+        let fullText = textarea.value
+        let matchRegex = getRegex()
+        let split = fullText.split(matchRegex)
+        let foundCount = split.length-1
+        let newText = split.join(replace)
+        let newStatus
+        if(replace){
+            newStatus = "Replaced "+foundCount+" instances of '"+findStr+"' with '"+replace+"'"
+        } else {
+            newStatus = "Deleted "+foundCount+" instances of '"+findStr+"'"
+        }
+        if(!foundCount) newStatus += " (did nothing!)"
+        newStatus += "."
+        findStatus.innerText = newStatus
+        setText(newText, 0, fullText.length, 'start')
+    }
+    let pre = document.getElementById('highlighting')
+    let maxChars
+    let charCountX
+    let charCountY
+    let lineHeightInPx
+    { //putting inside a block because I don't want these polluting the local scope
+        let computedStyle = window.getComputedStyle(textarea)
+        let pxInRem = parseFloat(window.getComputedStyle(document.documentElement).fontSize) //using parsefloat to get rid of the px
+        let paddingX = parseFloat(computedStyle.paddingLeft) + parseFloat(computedStyle.paddingRight)
+        let paddingY = parseFloat(computedStyle.paddingTop) + parseFloat(computedStyle.paddingBottom)
+        let widthInPx = textarea.clientWidth - paddingX
+        let heightInPx = textarea.clientHeight - paddingY
+        let font = window.getComputedStyle(textarea).font
+        let canvas = document.createElement('canvas')
+        let ctx = canvas.getContext('2d')
+        ctx.font = font
+        let charWidthInPx = ctx.measureText('0').width //any character should be the same
+        lineHeightInPx = pxInRem * parseFloat(styles.lineHeight)
+        charCountX = Math.floor(widthInPx/charWidthInPx)
+        charCountY = Math.ceil(heightInPx/lineHeightInPx)
+        maxChars = charCountX * charCountY
+    }
+
+    let tokenize = (text, rulesObj, color = config.editor.color, base = 0) => {
+        if(!text) return []
+        let rules = Array.isArray(rulesObj) ? rulesObj.reduce((p, c) => p[c], config.editor.syntax) : rulesObj
+        
+        if(!rules.$_compiled_$) { //process the list of rules if not already compiled, since the object holds the reference, this only needs to be done once per object (until the page is refreshed or something)
+            rules.$_compiled_$ = Object.entries(rules).map(([key, [regex, col, sub]]) => ({
+                regex: new RegExp(regex.source, regex.flags.includes('y') ? regex.flags : regex.flags + 'y'), //using the y flag makes it 'sticky', so it only searchs at the start of search, reducing it from O(n^2) to O(n)
+                color: col,
+                subRules: sub
+            }))
+        }
+
+        let tokens = []
+        let cursor = 0
+        let plainTextStart = 0
+
+        let pushToken = (end, tokenColor, subRules, matchText) => {
+            if(cursor > plainTextStart) { //add the normal text in between
+                tokens.push({start: plainTextStart + base, end: cursor + base, color})
+            }
+            if(subRules) { //add the token itself (or recurse if it has sub rules)
+                tokens.push(...tokenize(matchText, subRules, tokenColor, cursor + base))
+            } else {
+                tokens.push({start: cursor+base, end: end+base, color: tokenColor||color})
+            }
+            cursor = end
+            plainTextStart = cursor
+        }
+
+        while(cursor < text.length) {
+            let matched = false
+            for(let i = 0; i < rules.$_compiled_$.length; i++) {
+                let rule = rules.$_compiled_$[i]
+                rule.regex.lastIndex = cursor //update the regex's rule to the current index so it's on the same page
+                let match = rule.regex.exec(text) //check if a match starts there (remember, it has to start exactly here)
+                if(match) {
+                    pushToken(rule.regex.lastIndex, rule.color, rule.subRules, match[0])
+                    matched = true //mark this index as matched
+                    break //no need to check anymore rules for this index
+                }
+            }
+            if(!matched) {
+                cursor++ //if no match found here then at least move by one character to avoid being stuck forever
+            }
+        }
+        if(cursor > plainTextStart) { //add the normal text at the very end
+            tokens.push({ start: plainTextStart + base, end: text.length + base, color })
+        }
+        return tokens
+    }
+    let getLines = str => {
+        let arr = str.match(new RegExp(".{0,"+charCountX+"}\\n?","g"))||['']
+        arr.pop()
+        return arr
+    }
+    let createIndexLookup = (lines) => {
+        let lookupArr = []
+        let index = 0
+        for(let i = 0; i < lines.length; i++) {
+            lookupArr.push(index)
+            index += lines[i].length
+        }
+        return lookupArr
+    }
+    let wrapText = (text,color) => '<span style="color:'+color+'">'+(escHtml(text))+'</span>'
+    let highlightCode = str => {
+        let tokens = tokenize(str,config.editor.syntax)
+        let lines = getLines(str)
+        let indexLookup = createIndexLookup(lines)
+        let currentColor = config.editor.color
+        let tokenLookup = Array(str.length)
+        for(let i = 0; i < tokens.length; i++) {
+            tokenLookup[tokens[i].start] = {...tokens[i]}
+        }
+        let nextColor = config.editor.color
+        let tokenIdx = 0 //index of token in tokens
+        let currTokenStart = 0 //index of token's start index (in the string) being chopped
+        for(let i = 0; i < lines.length; i++) {
+            let lnStart = indexLookup[i]
+            let lnEnd = indexLookup[i + 1] || str.length
+            while(tokens[tokenIdx] && tokens[tokenIdx].end <= lnStart) { //find a token that ends after the line starts
+                tokenIdx++
+                if(tokens[tokenIdx]) currTokenStart = tokens[tokenIdx].start
+            }
+            if(!tokenLookup[lnStart] && tokens[tokenIdx]) { //runs if there isn't already a token that starts exactly at this line, and the token actually exists
+                let prevToken = tokenLookup[currTokenStart] //get the token currently on (about to become the previous one)
+                if(prevToken) { //if the previous token exists (isn't undefined or something)
+                    let origEnd = prevToken.end
+                    prevToken.end = lnStart //now the previous token ends right where the line starts
+                    tokenLookup[lnStart] = {start:lnStart, end:origEnd, color:prevToken.color} //and where the previous token ends, the new token starts, retaining the color (basically split tokens at newlines)
+                    currTokenStart = lnStart //next line, start checking for tokens at the start of this line
+                }
+            }
+        }
+        for(let i = 0; i < lines.length; i++){
+            let lnStart = indexLookup[i]
+            let lnEnd = (indexLookup[i+1]||str.length)
+            if(!tokenLookup[lnStart]){
+                let prevToken = tokenLookup[tokens[tokenIdx-1].start]
+                tokenLookup[lnStart] = {start:lnStart,end:prevToken.end,color:prevToken.color}
+                prevToken.end = lnStart
+            }
+            while(((tokens[tokenIdx]?.end)||str.length)<lnEnd)tokenIdx++
+        }
+        let finalLines = []
+        for(let i = 0; i < lines.length; i++) {
+            let lnStart = indexLookup[i]
+            let lnEnd = indexLookup[i + 1] || str.length
+            let lineHTML = ""
+            for(let j = lnStart; j < lnEnd;) { //go over the tokens for this line, using j because i is already used :D
+                let token = tokenLookup[j] //get the current token
+                if(token) {
+                    lineHTML += wrapText(str.slice(j, token.end), token.color)
+                    j = token.end //search from the end of this token next time
+                } else {
+                    j++ //prevent infinite loops just in case
+                }
+            }
+            finalLines.push(lineHTML)
+        }
+        finalLines.push("\n") //add a final newline
+        return finalLines
+    }
+    let lastText = ""
+    let coloredLines = []
+    let updateHighlighting = () => {
+        let text = textarea.value
+        if(text !== lastText){
+            coloredLines = highlightCode(text, config.editor.syntax)
+            lastText = textarea.value
+        }
+        let topLn = Math.floor(textarea.scrollTop/lineHeightInPx)
+        let botLn = topLn+charCountY
+        pre.innerHTML = coloredLines.slice(topLn,botLn).join('')
+        let offset = textarea.scrollTop % lineHeightInPx
+        pre.scrollTop = offset
+    }
+    textarea.addEventListener('input',()=>{if(textarea.value!==lastText)updateHighlighting()})
+    textarea.addEventListener('scroll', updateHighlighting)
+}
+        </script>
+        </div>
+    </div>
+    <!-- end of code editor -->
+</body>
+</html>
